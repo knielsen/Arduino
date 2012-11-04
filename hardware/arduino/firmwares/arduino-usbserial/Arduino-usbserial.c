@@ -837,14 +837,18 @@ ISR(SPI_STC_vect)
 
     /* Now card init is done. Switch to full speed and start reading! */
   after_sdhc_check:
+
     /*
       Wait 2 seconds, so cube gets time to settle and we get in sync.
       Then start reading the file!
+    */
+    spi_running = 2;
+    set_serial_to_500k();
 
+    /*
       We do the wait by setting a flag that makes the timeout handler
       write an 0xff to the SPI output register to get us rolling again.
     */
-
     timeout_wake_spi_flag = 1;
     timeout_counter = 200;
     spi_current = 10;
@@ -853,8 +857,6 @@ ISR(SPI_STC_vect)
   /* Now we start reading out data from the file. */
   case 10:
     spi_config_highspeed();
-    spi_running = 2;
-    set_serial_to_500k();
 
   start_over_from_beginning:
     fat_st.state = 0;
