@@ -41,6 +41,23 @@
 
 #include "ev_fat.h"
 
+/*
+  These pins are the SPI pins on the SPI header next to the reset button and
+  USB connector on the Arduino Uno rev.3. Additionally, we put slave select
+  and card detect on two of the four extra Atmega16U2 GPIO that have pads
+  (but no header) marked "JP2". (Card detect is currently unused).
+
+  SPI Pinout:
+
+    MISO 1 * * 2 5V
+     SCK 3 * * 4 MOSI
+   RESET 5 * * 6 GND     (the reset pin is the one closest to the reset button)
+
+  JP2 pad pinout:
+
+        19 * * 18        (18 is the one closest to the TX LED)
+	21 * * 20        (21 is the one closest to the reset button)
+*/
 #define pin_MISO MISO
 #define pin_MOSI MOSI
 #define pin_SCK  SCLK
@@ -48,6 +65,7 @@
 #define pin_CD   20
 
 #define FRAMERATE 2   /* period 2 centiseconds -> 50 Hz framerate */
+#define FRAME_SIZE 672
 
 
 /** Circular buffer to hold data from the host before it is sent to the device via the serial port. */
@@ -89,37 +107,124 @@ USB_ClassInfo_CDC_Device_t VirtualSerial_CDC_Interface =
 	};
 
 
-//static const char *filename = "FAT-TEST.000";
 static const char *filename = "LED-CUBE.000";
 
+/* This is the current state in the SD card reader state machine. */
 static uint8_t spi_current;
+/*
+  General counter used in SPI state machine to count how many bytes to receive
+  etc.
+*/
 static uint16_t spi_counter;
+/*
+  Counter to handle timouts.
+  Set to the desired timeout, in units of centiseconds (1/100 seconds).
+  Then it counts down in a timer interrupt.
+  When it reaches zero, it is set to (and remains at) 0xff as a timeout flag.
+  Set to 0 to disable timeout.
+*/
 static volatile uint8_t timeout_counter;
+/*
+  When set to 1, then timeout sends 0xff to the SPI output register to wakeup
+  the SPI state machine, instead of setting the 0xff timeout flag.
+*/
 static volatile uint8_t timeout_wake_spi_flag;
+/* Pending data byte when throttling to maintain correct frame rate. */
 static volatile uint8_t delayed_byte;
+/* Set to 1 if waiting for time slot of start of next frame. */
 static volatile uint8_t delayed_frame_flag;
+/* Counts down from FRAMERATE to 0 to maintain correct frame rate. */
 static volatile uint8_t frame_timer;
+/* Set to 1 when spi temporarily paused waiting for room in serial FIFO. */
 static volatile uint8_t spi_delay_flag;
+/*
+  Set to 0 when not doing SPI / SD-card.
+  Set to 1 when trying to init SD-card.
+  Set to 2 when SD-card detected and actively streaming data to serial.
+*/
 static volatile uint8_t spi_running;
 
-static enum { SD_TYPE_SD1, SD_TYPE_SD2, SD_TYPE_SDHC } sd_type;
+/* Different types of SD cards, detected during card init. */
+enum enum_sd_type { SD_TYPE_SD1, SD_TYPE_SD2, SD_TYPE_SDHC };
+static int8_t sd_type;
+/* State while running an SD card command. */
 static uint8_t cmd_buf[6];
 static uint8_t cmd_ptr;
 static uint8_t cmd_result;
-
 static uint8_t sd_acmd_cmd;
 static uint32_t sd_acmd_arg;
 
 static void sdcard_init(void);
 static void spi_start(void);
 
-
+/* For debugging, inject one byte on the serial->usb data stream. */
 static void
 outc(char c)
 {
-  return;
   if (USB_DeviceState == DEVICE_STATE_Configured && !RingBuffer_IsFull(&USARTtoUSB_Buffer))
     RingBuffer_Insert(&USARTtoUSB_Buffer, c);
+}
+
+/* Deselect the SD card, disabling it. */
+static void
+sd_card_deselect(void)
+{
+  pin_high(pin_SS);
+}
+
+
+/* Select the SD card, enabling it. */
+static void
+sd_card_select(void)
+{
+  pin_low(pin_SS);
+}
+
+
+static void
+sd_error(void)
+{
+  spi_current = 0xfe;
+  sd_card_deselect();
+  /* Set a new timeout so we try again a bit later. */
+  timeout_wake_spi_flag = 0;
+  timeout_counter = 200;
+  spi_running = 0;
+}
+
+
+/* Don't do SD card until >2 sek of USB inactivity. */
+static void
+mark_usb_activity(void)
+{
+  uint8_t running = spi_running;
+  if (running)
+  {
+    sd_error();
+    /* Reset the serial speed back to what USB thinks it is. */
+    if (running == 2)
+      EVENT_CDC_Device_LineEncodingChanged(&VirtualSerial_CDC_Interface);
+  }
+  timeout_counter = 200;
+}
+
+
+/* Change the serial speed to the 500kbit/sec that cube needs. */
+static void
+set_serial_to_500k(void)
+{
+  /* Wait for serial idle first. */
+  while (!(UCSR1A & (1 << UDRE1)))
+    ;
+  /* Turn off serial before reconfiguring. */
+  UCSR1B = 0;
+  UCSR1A = 0;
+  UCSR1C = 0;
+  /* Set 500kbit, no parity, 8 bit, one stop bit. */
+  UBRR1 = 3;
+  UCSR1C = (1 << UCSZ11) | (1 << UCSZ10);
+  UCSR1A = (1 << U2X1);
+  UCSR1B = (1 << RXCIE1) | (1 << TXEN1) | (1 << RXEN1);
 }
 
 
@@ -141,18 +246,17 @@ int main(void)
 
 	for (;;)
 	{
-		uint8_t i = 0;
-
 		/* Only try to read in bytes from the CDC interface if the transmit buffer is not full */
-		while (++i <= 16 && !(RingBuffer_IsFull(&USBtoUSART_Buffer)))
+		if (!(RingBuffer_IsFull(&USBtoUSART_Buffer)))
 		{
 			int16_t ReceivedByte = CDC_Device_ReceiveByte(&VirtualSerial_CDC_Interface);
 
 			/* Read bytes from the USB OUT endpoint into the USART transmit buffer */
 			if (!(ReceivedByte < 0))
+			{
 			  RingBuffer_Insert(&USBtoUSART_Buffer, ReceivedByte);
-			else
-			  break;
+			  mark_usb_activity();
+			}
 		}
 		
 		/* Check if the UART receive buffer flush timer has expired or the buffer is nearly full */
@@ -181,7 +285,8 @@ int main(void)
 		
 		/* Load the next byte from the USART transmit buffer into the USART */
 		if (!(RingBuffer_IsEmpty(&USBtoUSART_Buffer))) {
-		  Serial_TxByte(RingBuffer_Remove(&USBtoUSART_Buffer));
+		  uint8_t b = RingBuffer_Remove(&USBtoUSART_Buffer);
+		  Serial_TxByte(b);
 		  	
 		  	LEDs_TurnOnLEDs(LEDMASK_RX);
 			PulseMSRemaining.RxLEDPulse = TX_RX_LED_PULSE_MS;
@@ -206,9 +311,9 @@ int main(void)
 		CDC_Device_USBTask(&VirtualSerial_CDC_Interface);
 		USB_USBTask();
 
+		/* If no activity for 2 sec, try detect and use an SD card. */
                 if (!spi_running && timeout_counter == 0xff)
                 {
-                  outc('.');
                   timeout_counter = 0;
                   spi_start();
                 }
@@ -294,6 +399,8 @@ void EVENT_CDC_Device_LineEncodingChanged(USB_ClassInfo_CDC_Device_t* const CDCI
 	UCSR1C = ConfigMask;
 	UCSR1A = (CDCInterfaceInfo->State.LineEncoding.BaudRateBPS == 57600) ? 0 : (1 << U2X1);
 	UCSR1B = ((1 << RXCIE1) | (1 << TXEN1) | (1 << RXEN1));
+
+	mark_usb_activity();
 }
 
 /** ISR to manage the reception of data from the serial port, placing received bytes into a circular buffer
@@ -319,22 +426,7 @@ void EVENT_CDC_Device_ControLineStateChanged(USB_ClassInfo_CDC_Device_t* const C
 	  AVR_RESET_LINE_PORT &= ~AVR_RESET_LINE_MASK;
 	else
 	  AVR_RESET_LINE_PORT |= AVR_RESET_LINE_MASK;
-}
-
-
-/* Deselect the SD card, disabling it. */
-static void
-sd_card_deselect(void)
-{
-  pin_high(pin_SS);
-}
-
-
-/* Select the SD card, enabling it. */
-static void
-sd_card_select(void)
-{
-  pin_low(pin_SS);
+	mark_usb_activity();
 }
 
 
@@ -444,8 +536,6 @@ spi_config_highspeed(void)
      - Master
      - 4 MHz clock (d4) (8MHz doesn't seem to work).
   */
-//  SPCR = (1<<SPE) | (1<<SPIE) | (1<<MSTR) | 0*(1<<SPR1) | 1*(1<<SPR0);
-//  SPSR = 0*(1<<SPI2X);
   SPCR = (1<<SPE) | (1<<SPIE) | (1<<MSTR) | 0*(1<<SPR1) | 0*(1<<SPR0);
   SPSR = 0*(1<<SPI2X);
 }
@@ -513,18 +603,6 @@ spi_send_from_ISR(uint8_t byte)
 {
   cli();
   SPDR = byte;
-}
-
-
-static void
-sd_error(void)
-{
-  spi_current = 0xfe;
-  sd_card_deselect();
-  /* Set a new timeout so we try again a bit later. */
-  timeout_wake_spi_flag = 0;
-  timeout_counter = 200;
-  spi_running = 0;
 }
 
 
@@ -611,11 +689,12 @@ ISR(SPI_STC_vect)
   static uint8_t meta_data;
   static uint8_t file_open;
   static uint16_t frame_sofar;
+  static uint32_t remain_bytes;
 
   /*
     We need to take care that the SPI interrupt handler does not lock out
     the serial interrupt for too long. At 500kbit, we need to service the
-    serial interrupt with less than 320 instructions latency, or we can loose
+    serial interrupt with less than 320 instructions latency, or we can lose
     bytes.
 
     There are two ways that we can lock out other interrupt handlers:
@@ -636,7 +715,6 @@ ISR(SPI_STC_vect)
   sei();
   if (timeout_counter == 0xff)
   {
-    outc('!');
     sd_error();
     return;
   }
@@ -644,7 +722,6 @@ ISR(SPI_STC_vect)
   switch(spi_current)
   {
   case 0:
-outc('+');
     if (spi_counter++ < 10)
     {
       spi_send_from_ISR(0xff);
@@ -654,12 +731,10 @@ outc('+');
     /* Now send a command 0, GO_IDLE_STATE. */
     sd_cmd_start(0,0);
     ++spi_current;
-outc('/');
     break;
   case 1:
     if (sd_cmd_cont())
       break;
-outc('#');
     sd_card_deselect();
     if (cmd_result != 0x01)
     {
@@ -673,7 +748,6 @@ outc('#');
     ++spi_current;
     break;
   case 2:
-outc('2');
     if (sd_cmd_cont())
       break;
     if (cmd_result & 0x04)
@@ -691,7 +765,6 @@ outc('2');
     ++spi_current;
     break;
   case 3:
-outc('3');
     --spi_counter;
     b = SPDR;
     if (spi_counter != 0)
@@ -710,7 +783,6 @@ outc('3');
     sd_acmd_start(41, (sd_type == SD_TYPE_SD2 ? 0x40000000 : 0));
     ++spi_current;
   case 4:
-outc('4');
     if (sd_acmd_cont())
       break;
     sd_card_deselect();
@@ -726,7 +798,6 @@ outc('4');
     ++spi_current;
     break;
   case 5:
-outc('5');
     if (sd_cmd_cont())
       break;
     if (cmd_result != 0)
@@ -740,7 +811,6 @@ outc('5');
     ++spi_current;
     break;
   case 6:
-outc('6');
     b = SPDR;
     if (spi_counter == 4)
     {
@@ -762,7 +832,6 @@ outc('6');
 
     /* Now card init is done. Switch to full speed and start reading! */
   after_sdhc_check:
-outc('I');
     /*
       Wait 2 seconds, so cube gets time to settle and we get in sync.
       Then start reading the file!
@@ -779,9 +848,12 @@ outc('I');
   /* Now we start reading out data from the file. */
   case 10:
     spi_config_highspeed();
+    spi_running = 2;
+    set_serial_to_500k();
+
+  start_over_from_beginning:
     fat_st.state = 0;
     file_open = 0;
-    frame_sofar = 0;
 
   do_next_ev_fat_action:
 
@@ -809,7 +881,12 @@ outc('I');
     goto do_read_block;
 
   read_data_from_sector:
-    file_open = 1;
+    if (!file_open)
+    {
+      remain_bytes = fat_st.st_get_block_done.length;
+      frame_sofar = 0;
+      file_open = 1;
+    }
     sector = fat_st.st_get_block_done.sector;
     read_skip = 0;
     read_len = 512;
@@ -820,7 +897,6 @@ outc('I');
 
   case 20:
   do_read_block:
-outc('r');
     /* Set a 500 msec read timeout. */
     timeout_counter = 50;
     sd_cmd_start(17, (sd_type == SD_TYPE_SDHC ? sector : sector << 9));
@@ -885,19 +961,16 @@ outc('r');
           send or timer) will send a new 0xff on the SPI and get things
           running again.
         */
+	--remain_bytes;
         ++frame_sofar;
-        if (frame_sofar == 672)
+        if (frame_sofar == FRAME_SIZE)
         {
-outc('T');
           /* Throttle sending of last byte of frame to a 50Hz rate. */
           frame_sofar = 0;
           throttle = 1;
         }
         if (throttle_deliver_byte(b, throttle, 1))
           spi_send_from_ISR(0xff);
-        else
-outc('t');
-
       }
       break;
     }
@@ -906,15 +979,16 @@ outc('t');
     ++spi_current;
     break;
   case 24:
-outc('j');
     /* Discard the second CRC byte. */
     sd_card_deselect();
     spi_send_from_ISR(0xff);
     ++spi_current;
     break;
   case 25:
-outc('k');
-    goto do_next_ev_fat_action;
+    if (file_open && remain_bytes < FRAME_SIZE)
+      goto start_over_from_beginning;
+    else
+      goto do_next_ev_fat_action;
   }
 }
 
