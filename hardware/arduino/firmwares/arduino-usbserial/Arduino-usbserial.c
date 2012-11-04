@@ -233,6 +233,8 @@ set_serial_to_500k(void)
  */
 int main(void)
 {
+	static const int8_t disable_usb = 1;
+
 	SetupHardware();
         sdcard_init();
 
@@ -247,7 +249,7 @@ int main(void)
 	for (;;)
 	{
 		/* Only try to read in bytes from the CDC interface if the transmit buffer is not full */
-		if (!(RingBuffer_IsFull(&USBtoUSART_Buffer)))
+		if (!disable_usb && !(RingBuffer_IsFull(&USBtoUSART_Buffer)))
 		{
 			int16_t ReceivedByte = CDC_Device_ReceiveByte(&VirtualSerial_CDC_Interface);
 
@@ -271,7 +273,7 @@ int main(void)
 			}
 
 			/* Read bytes from the USART receive buffer into the USB IN endpoint */
-			while (BufferCount--)
+			while (!disable_usb && BufferCount--)
 			  CDC_Device_SendByte(&VirtualSerial_CDC_Interface, RingBuffer_Remove(&USARTtoUSB_Buffer));
 			  
 			/* Turn off TX LED(s) once the TX pulse period has elapsed */
@@ -307,9 +309,12 @@ int main(void)
                         }
                         sei();
 		}
-		
-		CDC_Device_USBTask(&VirtualSerial_CDC_Interface);
-		USB_USBTask();
+
+                if (!disable_usb)
+                {
+                  CDC_Device_USBTask(&VirtualSerial_CDC_Interface);
+                  USB_USBTask();
+                }
 
 		/* If no activity for 2 sec, try detect and use an SD card. */
                 if (!spi_running && timeout_counter == 0xff)
@@ -328,7 +333,7 @@ void SetupHardware(void)
 	wdt_disable();
 
 	/* Hardware Initialization */
-	Serial_Init(500000, false);
+	Serial_Init(9600, false);
 	LEDs_Init();
 	USB_Init();
 
@@ -888,8 +893,6 @@ ISR(SPI_STC_vect)
       file_open = 1;
     }
     sector = fat_st.st_get_block_done.sector;
-    read_skip = 0;
-    read_len = 512;
     meta_data = 0;
     spi_current = 20;
     goto do_read_block;
@@ -951,8 +954,13 @@ ISR(SPI_STC_vect)
       }
       else
       {
-        uint8_t throttle = 0;
-        read_len--;
+        uint8_t throttle;
+        /* Skip any extra data at the end of the last block of the file. */
+        if (remain_bytes == 0)
+        {
+          spi_send_from_ISR(0xff);
+          break;
+        }
         /*
           Try to deliver the byte to the serial port.
           This may fail due to needing to throttle (serial FIFO is full or
@@ -969,6 +977,8 @@ ISR(SPI_STC_vect)
           frame_sofar = 0;
           throttle = 1;
         }
+        else
+          throttle = 0;
         if (throttle_deliver_byte(b, throttle, 1))
           spi_send_from_ISR(0xff);
       }
@@ -985,7 +995,7 @@ ISR(SPI_STC_vect)
     ++spi_current;
     break;
   case 25:
-    if (file_open && remain_bytes < FRAME_SIZE)
+    if (file_open && remain_bytes == 0)
       goto start_over_from_beginning;
     else
       goto do_next_ev_fat_action;
