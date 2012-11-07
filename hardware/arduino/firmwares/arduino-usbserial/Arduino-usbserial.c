@@ -615,7 +615,6 @@ static void
 sd_cmd_start(uint8_t cmd, uint32_t arg)
 {
   sd_card_select();
-  spi_send_from_ISR(0xff);
   cmd_buf[0] = cmd | 0x40;
   cmd_buf[1] = (arg >> 24) & 0xff;
   cmd_buf[2] = (arg >> 16) & 0xff;
@@ -623,6 +622,7 @@ sd_cmd_start(uint8_t cmd, uint32_t arg)
   cmd_buf[4] = arg & 0xff;
   cmd_buf[5] = cmd ? 0x87 : 0x95;
   cmd_ptr = 0;
+  spi_send_from_ISR(0xff);
 }
 
 static uint8_t
@@ -1024,7 +1024,9 @@ sdcard_init(void)
 {
   pin_mode_output(pin_MOSI);
   pin_mode_input(pin_MISO);
+pin_high(pin_MISO);  /* Setting high enables internal pull-up. */
   pin_mode_output(pin_SCK);
+  pin_high(pin_SS);
   pin_mode_output(pin_SS);
   /*
     The "real" SPI slave select pin must be set to output for SPI to work. But
