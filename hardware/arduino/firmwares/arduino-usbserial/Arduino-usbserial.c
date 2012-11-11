@@ -188,8 +188,14 @@ sd_error(void)
   sd_card_deselect();
   /* Set a new timeout so we try again a bit later. */
   timeout_wake_spi_flag = 0;
+  /*
+    Let's make this atomic so we don't have to worry about races with the
+    timeout interrupt.
+  */
+  cli();
   timeout_counter = 200;
   spi_running = 0;
+  sei();
 }
 
 
@@ -197,15 +203,24 @@ sd_error(void)
 static void
 mark_usb_activity(void)
 {
-  uint8_t running = spi_running;
+  uint8_t running;
+
+  /* Atomic to not race with timeout interrupt. */
+  cli();
+  running = spi_running;
   if (running)
   {
     sd_error();
+    sei();
     /* Reset the serial speed back to what USB thinks it is. */
     if (running == 2)
       EVENT_CDC_Device_LineEncodingChanged(&VirtualSerial_CDC_Interface);
   }
-  timeout_counter = 200;
+  else
+  {
+    timeout_counter = 200;
+    sei();
+  }
 }
 
 
@@ -292,13 +307,6 @@ int main(void)
                 {
                   CDC_Device_USBTask(&VirtualSerial_CDC_Interface);
                   USB_USBTask();
-                }
-
-		/* If no activity for 2 sec, try detect and use an SD card. */
-                if (!spi_running && timeout_counter == 0xff)
-                {
-                  timeout_counter = 0;
-                  spi_start();
                 }
 	}
 }
@@ -582,6 +590,12 @@ ISR(TIMER1_COMPA_vect) {
         timeout_wake_spi_flag = 0;
         timeout_counter = 0;
         SPDR = 0xff;
+      }
+      else if (!spi_running)
+      {
+        /* No USB activity for a while, so start SPI/SD-card running. */
+        timeout_counter = 0;
+        spi_start();
       }
       else
       {
