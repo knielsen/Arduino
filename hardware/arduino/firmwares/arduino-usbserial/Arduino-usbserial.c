@@ -256,7 +256,10 @@ int main(void)
 			/* Read bytes from the USB OUT endpoint into the USART transmit buffer */
 			if (!(ReceivedByte < 0))
 			{
+                          cli();
 			  RingBuffer_Insert(&USBtoUSART_Buffer, ReceivedByte);
+                          UCSR1B |= (1 << UDRIE1);
+                          sei();
 			  mark_usb_activity();
 			}
 		}
@@ -283,31 +286,6 @@ int main(void)
 			/* Turn off RX LED(s) once the RX pulse period has elapsed */
 			if (PulseMSRemaining.RxLEDPulse && !(--PulseMSRemaining.RxLEDPulse))
 			  LEDs_TurnOffLEDs(LEDMASK_RX);
-		}
-		
-		/* Load the next byte from the USART transmit buffer into the USART */
-		if (!(RingBuffer_IsEmpty(&USBtoUSART_Buffer))) {
-		  uint8_t b = RingBuffer_Remove(&USBtoUSART_Buffer);
-		  Serial_TxByte(b);
-		  	
-		  	LEDs_TurnOnLEDs(LEDMASK_RX);
-			PulseMSRemaining.RxLEDPulse = TX_RX_LED_PULSE_MS;
-
-                        /*
-                          If SPI was throttled due to full FIFO, restart it
-                          now that there is room again.
-
-			  Note! We have to re-check buffer full, in case we
-			  race and fill it again between removing one byte and
-			  disabling interrupt.
-                        */
-                        cli();
-                        if (spi_delay_flag && !(RingBuffer_IsFull(&USBtoUSART_Buffer)))
-                        {
-                          spi_delay_flag = 0;
-                          SPDR = 0xff;
-                        }
-                        sei();
 		}
 
                 if (!disable_usb)
@@ -436,6 +414,43 @@ void EVENT_CDC_Device_ControLineStateChanged(USB_ClassInfo_CDC_Device_t* const C
 
 
 /*
+  Interrupt for when UART is ready to transmit a new byte.
+*/
+ISR(USART1_UDRE_vect)
+{
+  /* Output next byte. */
+  UDR1 = RingBuffer_Remove(&USBtoUSART_Buffer);
+
+  /*
+    If SPI was throttled due to full FIFO, restart it now that there is room
+    again.
+  */
+  if (spi_delay_flag)
+  {
+    SPDR = 0xff;
+    spi_delay_flag = 0;
+  }
+
+  /* Disable further interrupts if we emptied the FIFO. */
+  if (RingBuffer_IsEmpty(&USBtoUSART_Buffer))
+    UCSR1B &= ~(1 << UDRIE1);
+
+  /*
+    Flash the Rx LED (Rx because we *received* a byte from USB).
+
+    Note that we are racy here. We might interrupt after main loop has
+    detected the end-of-pulse but before it has turned off the LED. If so,
+    then the LED will be immediately turned off, and we will skip pulsing
+    Rx for this byte.
+
+    It does not really matter, a rare missed-blink is not important.
+  */
+  LEDs_TurnOnLEDs(LEDMASK_RX);
+  PulseMSRemaining.RxLEDPulse = TX_RX_LED_PULSE_MS;
+}
+
+
+/*
   Deliver a byte to the serial FIFO.
 
   Return 1 if there is still room in the FIFO, 0 if it is full after
@@ -449,11 +464,11 @@ static uint8_t
 deliver_or_throttle_serial(uint8_t byte, uint8_t interrupt_enabled)
 {
   /* Deliver the byte. */
+  cli();
   RingBuffer_Insert(&USBtoUSART_Buffer, byte);
-  // ToDo serial_interrupt_dre_enable();
+  UCSR1B |= (1 << UDRIE1);
 
   /* Atomically check if FIFO is full, and set the throttle flag if so. */
-  cli();
   if (RingBuffer_IsFull(&USBtoUSART_Buffer))
   {
     /* Full. Throttle SPI until there is room again. */
