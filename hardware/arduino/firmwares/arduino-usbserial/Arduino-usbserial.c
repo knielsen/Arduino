@@ -248,8 +248,6 @@ set_serial_to_500k(void)
  */
 int main(void)
 {
-	static const int8_t disable_usb = 1;
-
 	SetupHardware();
         sdcard_init();
 
@@ -264,7 +262,7 @@ int main(void)
 	for (;;)
 	{
 		/* Only try to read in bytes from the CDC interface if the transmit buffer is not full */
-		if (!disable_usb && !(RingBuffer_IsFull(&USBtoUSART_Buffer)))
+		if (!(RingBuffer_IsFull(&USBtoUSART_Buffer)))
 		{
 			int16_t ReceivedByte = CDC_Device_ReceiveByte(&VirtualSerial_CDC_Interface);
 
@@ -291,7 +289,7 @@ int main(void)
 			}
 
 			/* Read bytes from the USART receive buffer into the USB IN endpoint */
-			while (!disable_usb && BufferCount--)
+			while (BufferCount--)
 			  CDC_Device_SendByte(&VirtualSerial_CDC_Interface, RingBuffer_Remove(&USARTtoUSB_Buffer));
 			  
 			/* Turn off TX LED(s) once the TX pulse period has elapsed */
@@ -302,12 +300,9 @@ int main(void)
 			if (PulseMSRemaining.RxLEDPulse && !(--PulseMSRemaining.RxLEDPulse))
 			  LEDs_TurnOffLEDs(LEDMASK_RX);
 		}
-
-                if (!disable_usb)
-                {
-                  CDC_Device_USBTask(&VirtualSerial_CDC_Interface);
-                  USB_USBTask();
-                }
+		
+		CDC_Device_USBTask(&VirtualSerial_CDC_Interface);
+		USB_USBTask();
 	}
 }
 
