@@ -55,8 +55,8 @@
 
   JP2 pad pinout:
 
-        19 * * 18        (18 is the one closest to the TX LED)
-	21 * * 20        (21 is the one closest to the reset button)
+        19 * * 18 SS     (18 is the one closest to the TX LED)
+	21 * * 20 CD     (21 is the one closest to the reset button)
 */
 #define pin_MISO MISO
 #define pin_MOSI MOSI

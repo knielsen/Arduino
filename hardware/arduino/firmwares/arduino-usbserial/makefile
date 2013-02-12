@@ -258,6 +258,7 @@ CFLAGS += -Wstrict-prototypes
 CFLAGS += -Wa,-adhlns=$(<:%.c=$(OBJDIR)/%.lst)
 CFLAGS += $(patsubst %,-I%,$(EXTRAINCDIRS))
 CFLAGS += $(CSTANDARD)
+CFLAGS += -fstack-usage -fdump-rtl-expand -Wno-unused-but-set-variable
 
 
 #---------------- Compiler Options C++ ----------------
