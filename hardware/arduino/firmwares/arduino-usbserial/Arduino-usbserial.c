@@ -157,6 +157,9 @@ static uint32_t sd_acmd_arg;
 static void sdcard_init(void);
 static void spi_start(void);
 
+static bool prevDTRState = 0;
+static uint8_t DTRCountdown = 0;
+
 /* For debugging, inject one byte on the serial->usb data stream. */
 static void
 outc(char c)
@@ -409,9 +412,29 @@ void EVENT_CDC_Device_ControLineStateChanged(USB_ClassInfo_CDC_Device_t* const C
 	bool CurrentDTRState = (CDCInterfaceInfo->State.ControlLineStates.HostToDevice & CDC_CONTROL_LINE_OUT_DTR);
 
 	if (CurrentDTRState)
-	  AVR_RESET_LINE_PORT &= ~AVR_RESET_LINE_MASK;
+        {
+          if (!prevDTRState)
+          {
+            AVR_RESET_LINE_PORT &= ~AVR_RESET_LINE_MASK;
+            prevDTRState = CurrentDTRState;
+
+            /*
+              The Arduino Uno has a 100nF capacitor in series between our
+              GPIO and the Atmega328 RESET input. So when we pull our GPIO
+              low, RESET briefly goes low and then high again.
+
+              But my board is missing this capacitor. So instead, set a
+              counter so we release RESET after 10-20 milliseconds.
+            */
+            DTRCountdown = 2;
+          }
+        }
 	else
+        {
 	  AVR_RESET_LINE_PORT |= AVR_RESET_LINE_MASK;
+          prevDTRState = CurrentDTRState;
+          DTRCountdown = 0;
+        }
 	mark_usb_activity();
 }
 
@@ -617,6 +640,14 @@ ISR(TIMER1_COMPA_vect) {
       delayed_frame_flag = 0;
       delayed_deliver_byte();
     }
+  }
+
+  /* Handle releasing reset shortly after DTR. */
+  if (DTRCountdown > 0)
+  {
+    --DTRCountdown;
+    if (DTRCountdown == 0)
+      AVR_RESET_LINE_PORT |= AVR_RESET_LINE_MASK;
   }
 }
 
