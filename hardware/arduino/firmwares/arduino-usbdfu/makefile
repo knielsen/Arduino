@@ -48,8 +48,8 @@
 
 
 # MCU name
-MCU = atmega8u2
-MCU_AVRDUDE = at90usb82
+MCU = atmega16u2
+MCU_AVRDUDE = atmega16u2
 
 # Specify the Arduino model using the assigned PID.  This is used by Descriptors.c
 #   to set the product descriptor string (for DFU we must use the PID for each
@@ -98,7 +98,7 @@ F_CLOCK = $(F_CPU)
 #
 # Note that the bootloader size and start address given in AVRStudio is in words and not
 # bytes, and so will need to be doubled to obtain the byte address needed by AVR-GCC.
-BOOT_START =  0x1000
+BOOT_START =  0x3000
 
 
 # Output format. (can be srec, ihex, binary)
@@ -352,7 +352,7 @@ LDFLAGS += $(PRINTF_LIB) $(SCANF_LIB) $(MATH_LIB)
 AVRDUDE_FUSES = -U efuse:w:0xF4:m -U hfuse:w:0xD9:m -U lfuse:w:0xFF:m 
 
 # Lock settings for Arduino Uno DFU bootloader project
-AVRDUDE_LOCK = -U lock:w:0x0F:m
+AVRDUDE_LOCK = -U lock:w:0x3F:m
 
 # Programming hardware
 # Type: avrdude -c ?
